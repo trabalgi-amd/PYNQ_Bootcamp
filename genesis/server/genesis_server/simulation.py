@@ -50,8 +50,9 @@ class GenesisSimulation:
         if self._initialized:
             return
 
-        backend = BACKEND_MAP.get(BACKEND, gs.cpu)
-        gs.init(backend=backend, theme="light")
+        # NOTE: gs.init() is now called ONCE at server startup (in server.py main())
+        # to prevent race conditions when multiple clients connect simultaneously.
+        # Do NOT call gs.init() here!
 
         # Show viewer on server if enabled and no other viewer is active
         show_viewer = self._show_viewer and not _viewer_active

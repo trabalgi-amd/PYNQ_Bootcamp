@@ -1,5 +1,6 @@
 import json
 import base64
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, Optional
 
@@ -14,6 +15,7 @@ import os
 class GenesisRequestHandler(BaseHTTPRequestHandler):
     session_manager: SessionManager = None
     simulations: Dict[str, GenesisSimulation] = {}
+    simulations_lock: threading.Lock = None  # Protects simulations dict access
     competition_manager: CompetitionManager = None
 
     def log_message(self, format, *args):
@@ -77,7 +79,10 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Invalid or expired session")
 
         self.session_manager.update_activity(token)
-        sim = self.simulations.get(token)
+
+        # Thread-safe dict read
+        with self.simulations_lock:
+            sim = self.simulations.get(token)
 
         if action == "add_object":
             obj_id = sim.add_object(
@@ -144,9 +149,9 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
             if not token:
                 return {"status": "error", "error": "missing token"}
 
-            # Remove from the registry first so the token can't be used
-            # by concurrent requests while we're tearing it down.
-            sim = self.simulations.pop(token, None)
+            # Thread-safe removal from registry
+            with self.simulations_lock:
+                sim = self.simulations.pop(token, None)
 
             if sim is None:
                 # Nothing registered under this token. Still attempt to
@@ -180,7 +185,10 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
 
         sim = GenesisSimulation(scene_name)
         sim.build()
-        self.simulations[token] = sim
+
+        # Thread-safe dict insertion
+        with self.simulations_lock:
+            self.simulations[token] = sim
 
         return {"token": token, "status": "ok"}
 
@@ -327,13 +335,15 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
             # is never inserted here, so the viewer would show "No active sessions".
             sim = self.competition_manager.get_simulation()
             if sim is not None:
-                self.simulations["competition"] = sim
+                with self.simulations_lock:
+                    self.simulations["competition"] = sim
             return {"status": "ok"}
 
         if action == "admin_stop_competition":
             self.competition_manager.stop()
             # Remove the competition sim from the streamed dict on stop.
-            self.simulations.pop("competition", None)
+            with self.simulations_lock:
+                self.simulations.pop("competition", None)
             return {"status": "ok"}
 
         if action == "admin_reset_board":
@@ -382,14 +392,29 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
 
 
 class GenesisServer(HTTPServer):
-    def __init__(self, port: int = PORT):
+    def __init__(self, port: int = PORT, backend: str = None):
+        # Initialize shared resources
         GenesisRequestHandler.session_manager = SessionManager(
             max_sessions=MAX_SESSIONS,
             timeout=SESSION_TIMEOUT,
             cleanup_interval=CLEANUP_INTERVAL,
         )
         GenesisRequestHandler.simulations = {}
+        GenesisRequestHandler.simulations_lock = threading.Lock()  # Thread-safe dict access
         GenesisRequestHandler.competition_manager = CompetitionManager()
+
+        # Initialize Genesis ONCE at startup (prevents concurrent init race conditions)
+        if backend is None:
+            from .config import BACKEND
+            backend = BACKEND
+
+        from .simulation import BACKEND_MAP
+        import genesis as gs
+
+        backend_obj = BACKEND_MAP.get(backend, gs.cpu)
+        print(f"  Initializing Genesis with backend: {backend}")
+        gs.init(backend=backend_obj, theme="light")
+        print(f"  Genesis initialized successfully")
 
         self.allow_reuse_address = True
         super().__init__(("", port), GenesisRequestHandler)
