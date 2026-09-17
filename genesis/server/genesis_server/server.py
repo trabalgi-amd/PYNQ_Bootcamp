@@ -190,11 +190,13 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
         sim = GenesisSimulation(scene_name)
         sim.build()
 
-        # Thread-safe dict insertion
+        # Thread-safe dict insertion and session ID calculation
         with self.simulations_lock:
             self.simulations[token] = sim
+            sorted_tokens = sorted(self.simulations.keys())
+            session_id = sorted_tokens.index(token) + 1
 
-        return {"token": token, "status": "ok"}
+        return {"token": token, "session_id": session_id, "status": "ok"}
 
     def _join_competition(self, params):
         team_id = params["team_id"]
@@ -425,6 +427,38 @@ class GenesisServer(HTTPServer):
 
         self.allow_reuse_address = True
         super().__init__(("", port), GenesisRequestHandler)
+
+        # Register cleanup callback for orphaned simulations (expired sessions)
+        def cleanup_orphaned_simulations():
+            from .stream_server import cleanup_viewer_state
+
+            # Get list of valid session tokens
+            valid_tokens = set()
+            with GenesisRequestHandler.session_manager._lock:
+                valid_tokens = set(GenesisRequestHandler.session_manager._sessions.keys())
+
+            # Find simulations with no matching session (excluding "competition" which is special)
+            with GenesisRequestHandler.simulations_lock:
+                orphaned = [
+                    token for token in GenesisRequestHandler.simulations.keys()
+                    if token != "competition" and token not in valid_tokens
+                ]
+
+            # Clean up orphaned simulations
+            for token in orphaned:
+                with GenesisRequestHandler.simulations_lock:
+                    sim = GenesisRequestHandler.simulations.pop(token, None)
+
+                cleanup_viewer_state(token)
+
+                if sim:
+                    try:
+                        sim.destroy()
+                        print(f"Cleaned up orphaned simulation: {token[:8]}")
+                    except Exception as e:
+                        print(f"Error destroying orphaned simulation {token[:8]}: {e}")
+
+        GenesisRequestHandler.session_manager.add_cleanup_callback(cleanup_orphaned_simulations)
 
         # Register stream server cleanup callback for orphaned viewer counts
         from .stream_server import cleanup_orphaned_viewer_counts

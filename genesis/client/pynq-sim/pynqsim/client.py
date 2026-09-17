@@ -23,6 +23,7 @@ class SimulationClient:
         """
         self.server_url = f"http://{server_ip}:{port}"
         self.token: Optional[str] = None
+        self.session_id: Optional[int] = None
         self._competition_mode = False
 
     def _request(self, action: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -43,15 +44,20 @@ class SimulationClient:
 
     # Standard Mode Methods
 
-    def create_environment(self, scene: str = "empty") -> None:
+    def create_environment(self, scene: str = "empty") -> int:
         """Create a new simulation environment.
 
         Args:
             scene: Scene to load. Options: "empty", "pick_and_place"
+
+        Returns:
+            Session ID number (useful for identifying your session in the stream viewer)
         """
         result = self._request("create_env", {"scene": scene})
         self.token = result["token"]
+        self.session_id = result.get("session_id")
         self._competition_mode = False
+        return self.session_id
 
     def add_cube(
         self, position: List[float], size: List[float] = None
@@ -262,6 +268,7 @@ class SimulationClient:
         else:
             self._request("destroy_env")
         self.token = None
+        self.session_id = None
 
     # Competition Mode Methods
 
