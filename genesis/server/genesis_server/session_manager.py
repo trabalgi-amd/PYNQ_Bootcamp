@@ -13,6 +13,7 @@ class SessionManager:
         self._cleanup_interval = cleanup_interval
         self._cleanup_thread: Optional[threading.Thread] = None
         self._running = False
+        self._cleanup_callbacks = []  # Optional callbacks to run during cleanup
 
     def create_session(self, scene_name: str) -> Optional[str]:
         with self._lock:
@@ -75,7 +76,17 @@ class SessionManager:
             self._cleanup_thread.join(timeout=1)
             self._cleanup_thread = None
 
+    def add_cleanup_callback(self, callback) -> None:
+        """Register a callback to run during each cleanup cycle."""
+        self._cleanup_callbacks.append(callback)
+
     def _cleanup_loop(self) -> None:
         while self._running:
             time.sleep(self._cleanup_interval)
             self.cleanup_expired()
+            # Run any registered cleanup callbacks
+            for callback in self._cleanup_callbacks:
+                try:
+                    callback()
+                except Exception as e:
+                    print(f"Cleanup callback error: {e}")

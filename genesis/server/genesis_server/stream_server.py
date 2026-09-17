@@ -15,9 +15,180 @@ import numpy as np
 
 # Will be set by the main server
 simulations: Dict[str, 'GenesisSimulation'] = {}
+simulations_lock: threading.Lock = None  # Protects simulations dict access
+
+# Track active stream viewers per token to manage camera recording state
+_stream_viewer_counts: Dict[str, int] = {}
+_viewer_counts_lock = threading.Lock()
 
 app = Flask(__name__)
 app.config['THREADED'] = True
+
+
+def _with_lock(func):
+    """Execute func while holding the simulations lock, if available."""
+    if simulations_lock is not None:
+        with simulations_lock:
+            return func()
+    return func()
+
+
+def _add_viewer(token: str, sim) -> bool:
+    """Register a new stream viewer for token. Returns True if this is the first viewer.
+
+    Recording is started in generate_frames() directly, not here.
+    """
+    with _viewer_counts_lock:
+        prev_count = _stream_viewer_counts.get(token, 0)
+        _stream_viewer_counts[token] = prev_count + 1
+        is_first = prev_count == 0
+
+    return is_first
+
+
+def _remove_viewer(token: str, sim) -> bool:
+    """Unregister a stream viewer for token. Returns True if this was the last viewer.
+
+    If last viewer, stops camera recording mode.
+    """
+    with _viewer_counts_lock:
+        count = _stream_viewer_counts.get(token, 0)
+        if count <= 1:
+            _stream_viewer_counts.pop(token, None)
+            is_last = True
+        else:
+            _stream_viewer_counts[token] = count - 1
+            is_last = False
+
+    if is_last and sim and sim.camera:
+        try:
+            sim.camera.pause_recording()
+        except Exception:
+            pass  # Ignore - sim may be shutting down
+
+    return is_last
+
+
+def cleanup_viewer_state(token: str) -> None:
+    """Clean up viewer tracking state for a destroyed simulation.
+
+    Called by the main server when a simulation is destroyed to ensure
+    viewer counts don't leak.
+    """
+    with _viewer_counts_lock:
+        _stream_viewer_counts.pop(token, None)
+
+
+def _generate_message_frame(message: str, color: tuple = (100, 100, 100)) -> bytes:
+    """Generate a JPEG frame with a centered text message.
+
+    Args:
+        message: Text to display
+        color: RGB tuple for text color
+
+    Returns:
+        JPEG image bytes (not wrapped in MJPEG frame format)
+    """
+    import io
+    from PIL import Image, ImageDraw
+
+    img = Image.new('RGB', (640, 480), color=(30, 30, 30))
+    draw = ImageDraw.Draw(img)
+
+    # Center the text
+    text_bbox = draw.textbbox((0, 0), message)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    x = (640 - text_width) // 2
+    y = (480 - text_height) // 2
+
+    draw.text((x, y), message, fill=color)
+
+    buffer = io.BytesIO()
+    img.save(buffer, format='JPEG', quality=85)
+    return buffer.getvalue()
+
+
+def stop_all_recordings() -> None:
+    """Stop all camera recordings before server shutdown.
+
+    Clears recording buffers to prevent Genesis from saving video files on exit.
+    """
+    with _viewer_counts_lock:
+        tokens = list(_stream_viewer_counts.keys())
+        _stream_viewer_counts.clear()
+
+    def _stop_recordings():
+        for token in tokens:
+            sim = simulations.get(token)
+            if sim and sim.camera:
+                try:
+                    sim.camera.pause_recording()
+                    # Clear the recorded frames buffer to prevent video save
+                    if hasattr(sim.camera, '_recorded_imgs'):
+                        sim.camera._recorded_imgs = []
+                except Exception:
+                    pass
+
+        # Also check all simulations in case any were missed
+        for sim in simulations.values():
+            if sim and sim.camera:
+                try:
+                    sim.camera.pause_recording()
+                    if hasattr(sim.camera, '_recorded_imgs'):
+                        sim.camera._recorded_imgs = []
+                except Exception:
+                    pass
+
+    _with_lock(_stop_recordings)
+
+
+def cleanup_orphaned_viewer_counts() -> int:
+    """Remove viewer counts for tokens that no longer have active simulations.
+
+    Returns the number of orphaned entries cleaned up.
+    """
+    with _viewer_counts_lock:
+        # Get tokens that have viewer counts
+        tracked_tokens = list(_stream_viewer_counts.keys())
+
+    if not tracked_tokens:
+        return 0
+
+    # Check which tokens still have active simulations
+    def _get_active_tokens():
+        return set(simulations.keys())
+
+    active_tokens = _with_lock(_get_active_tokens)
+
+    # Find orphaned tokens
+    orphaned = [t for t in tracked_tokens if t not in active_tokens]
+
+    # Clean up orphaned entries
+    with _viewer_counts_lock:
+        for token in orphaned:
+            _stream_viewer_counts.pop(token, None)
+
+    if orphaned:
+        print(f"Cleaned up {len(orphaned)} orphaned viewer count(s)")
+
+    return len(orphaned)
+
+
+def _get_sim_snapshot(token):
+    """Get simulation and its state atomically under lock.
+
+    Returns a tuple of (sim, initialized, scene_name, num_robots, session_id)
+    or (None, False, None, 0, "?") if not found.
+    """
+    def _snapshot():
+        sim = simulations.get(token)
+        if sim is None:
+            return (None, False, None, 0, "?")
+        sorted_tokens = sorted(simulations.keys())
+        session_id = sorted_tokens.index(token) + 1 if token in sorted_tokens else "?"
+        return (sim, sim._initialized, sim.scene_name, len(sim.robots), session_id)
+    return _with_lock(_snapshot)
 
 
 VIEWER_TEMPLATE = """
@@ -245,15 +416,23 @@ VIEWER_TEMPLATE = """
 @app.route('/')
 def index():
     """Landing page showing available streams."""
-    active_sessions = []
-    for token, sim in simulations.items():
-        if sim._initialized:
-            active_sessions.append({
-                'token': token,
-                'token_short': token[:8],
-                'scene': sim.scene_name,
-                'num_robots': len(sim.robots)
-            })
+    # Thread-safe snapshot of active sessions
+    def _get_active_sessions():
+        active = []
+        sorted_tokens = sorted(simulations.keys())
+        for idx, token in enumerate(sorted_tokens, start=1):
+            sim = simulations.get(token)
+            if sim and sim._initialized:
+                active.append({
+                    'token': token,
+                    'token_short': token[:8],
+                    'scene': sim.scene_name,
+                    'num_robots': len(sim.robots),
+                    'session_id': idx
+                })
+        return active
+
+    active_sessions = _with_lock(_get_active_sessions)
 
     html = """
     <!DOCTYPE html>
@@ -322,7 +501,8 @@ def index():
 @app.route('/view/<token>')
 def view_simulation(token):
     """Viewer page for a specific simulation."""
-    sim = simulations.get(token)
+    # Thread-safe snapshot of simulation state
+    sim, initialized, scene_name, num_robots, session_id = _get_sim_snapshot(token)
 
     if not sim:
         return render_template_string(
@@ -330,10 +510,10 @@ def view_simulation(token):
             token=token,
             error=True,
             error_title="Session Not Found",
-            error_message=f"No active simulation found for this session. The session may have expired or been destroyed."
+            error_message="No active simulation found for this session. The session may have expired or been destroyed."
         )
 
-    if not sim._initialized:
+    if not initialized:
         return render_template_string(
             VIEWER_TEMPLATE,
             token=token,
@@ -345,8 +525,8 @@ def view_simulation(token):
     return render_template_string(
         VIEWER_TEMPLATE,
         token=token,
-        scene_name=sim.scene_name,
-        num_robots=len(sim.robots),
+        scene_name=scene_name,
+        num_robots=num_robots,
         error=False
     )
 
@@ -354,23 +534,15 @@ def view_simulation(token):
 @app.route('/stream/<token>')
 def stream_video(token):
     """MJPEG stream endpoint for a specific simulation."""
-    sim = simulations.get(token)
+    # Thread-safe check if simulation exists and is initialized
+    sim, initialized, _, _, _ = _get_sim_snapshot(token)
 
-    if not sim or not sim._initialized:
+    if not sim or not initialized:
         # Return a placeholder error image
         def generate_error():
-            import io
-            from PIL import Image, ImageDraw, ImageFont
-
-            img = Image.new('RGB', (640, 480), color=(30, 30, 30))
-            draw = ImageDraw.Draw(img)
-            draw.text((200, 220), "Session Not Found", fill=(255, 100, 100))
-
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG')
-
+            frame_data = _generate_message_frame("Session Not Found", color=(255, 100, 100))
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.getvalue() + b'\r\n')
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
 
         return Response(generate_error(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -378,36 +550,60 @@ def stream_video(token):
     def generate_frames():
         """Generate frames from the simulation camera."""
         frame_delay = 1.0 / 30.0  # Target 30 FPS
+        stream_ended_normally = False
 
-        # Start recording mode to enable frame capture
-        sim = simulations.get(token)
-        if not sim or not sim._initialized or not sim.camera:
+        # Thread-safe check and get simulation reference
+        sim, initialized, _, _, _ = _get_sim_snapshot(token)
+        if not sim or not initialized or not sim.camera:
             return
 
-        # Put camera in recording mode (but we won't save)
-        sim.camera.start_recording()
+        # Register this viewer for tracking
+        _add_viewer(token, sim)
+
+        # Always ensure recording is started (idempotent - safe to call multiple times)
+        try:
+            sim.camera.start_recording()
+        except Exception as e:
+            print(f"[Stream] start_recording error for {token[:8]}: {e}")
+
+        # Track the last valid sim reference for cleanup
+        last_valid_sim = sim
+        frame_count = 0
 
         try:
             while True:
                 try:
-                    # Check if simulation still exists
-                    if token not in simulations or not simulations[token]._initialized:
+                    # Thread-safe check if simulation still exists
+                    current_sim, current_initialized, _, _, _ = _get_sim_snapshot(token)
+                    if not current_sim or not current_initialized:
+                        # Simulation was destroyed - send a final "ended" frame
+                        stream_ended_normally = True
                         break
 
-                    sim = simulations[token]
+                    sim = current_sim
+                    last_valid_sim = sim  # Update last valid reference
 
                     if sim.camera:
                         # Render current frame
                         sim.camera.render()
+
+                        # Debug: log recording state periodically
+                        if frame_count == 0:
+                            in_rec = getattr(sim.camera, '_in_recording', 'unknown')
+                            has_imgs = hasattr(sim.camera, '_recorded_imgs')
+                            img_count = len(sim.camera._recorded_imgs) if has_imgs else 0
+                            print(f"[Stream] {token[:8]}: in_recording={in_rec}, has_imgs={has_imgs}, count={img_count}")
 
                         # Access the recorded images buffer
                         if hasattr(sim.camera, '_recorded_imgs') and len(sim.camera._recorded_imgs) > 0:
                             # Get the most recent frame
                             rgba = sim.camera._recorded_imgs[-1]
 
-                            # Clear old frames to prevent memory buildup
-                            if len(sim.camera._recorded_imgs) > 5:
-                                sim.camera._recorded_imgs = sim.camera._recorded_imgs[-2:]
+                                # Clear old frames to prevent memory buildup (but keep a few for other viewers)
+                            if len(sim.camera._recorded_imgs) > 10:
+                                sim.camera._recorded_imgs = sim.camera._recorded_imgs[-5:]
+
+                            frame_count += 1
                         else:
                             time.sleep(frame_delay)
                             continue
@@ -439,18 +635,27 @@ def stream_video(token):
                         continue
 
                 except Exception as e:
+                    # Suppress common shutdown-related errors
+                    err_str = str(e)
+                    if 'UID' in err_str or 'shutdown' in err_str.lower() or 'closed' in err_str.lower():
+                        # Server is shutting down, exit gracefully
+                        break
                     print(f"Stream error for {token[:8]}: {e}")
                     import traceback
                     traceback.print_exc()
                     time.sleep(1.0)
                     continue
+
+            # Send a final "stream ended" frame so the browser shows a message
+            if stream_ended_normally:
+                ended_frame = _generate_message_frame("Session Ended - Refresh to Reconnect", color=(255, 200, 100))
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + ended_frame + b'\r\n')
+
         finally:
-            # Clean up recording mode when stream ends
-            try:
-                if sim and sim.camera:
-                    sim.camera.pause_recording()
-            except:
-                pass
+            # Unregister this viewer (stops recording if last viewer)
+            # Use last_valid_sim to ensure we call pause_recording on the right object
+            _remove_viewer(token, last_valid_sim)
 
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -459,15 +664,19 @@ def stream_video(token):
 @app.route('/snapshot/<token>')
 def get_snapshot(token):
     """Get a single snapshot (for debugging or fallback)."""
-    sim = simulations.get(token)
+    # Thread-safe check if simulation exists
+    sim, initialized, _, _, _ = _get_sim_snapshot(token)
 
-    if not sim or not sim._initialized or not sim.camera:
+    if not sim or not initialized or not sim.camera:
         return jsonify({'error': 'Session not found'}), 404
 
     try:
-        # Start recording temporarily to capture frame
-        was_recording = sim.camera._in_recording
-        if not was_recording:
+        # Check if there are active stream viewers (recording already started)
+        with _viewer_counts_lock:
+            has_active_viewers = _stream_viewer_counts.get(token, 0) > 0
+
+        # Start recording temporarily if no active viewers
+        if not has_active_viewers:
             sim.camera.start_recording()
 
         sim.camera.render()
@@ -476,10 +685,12 @@ def get_snapshot(token):
         if hasattr(sim.camera, '_recorded_imgs') and len(sim.camera._recorded_imgs) > 0:
             rgba = sim.camera._recorded_imgs[-1]
         else:
+            if not has_active_viewers:
+                sim.camera.pause_recording()
             return jsonify({'error': 'No frame available'}), 500
 
-        # Stop recording if we started it
-        if not was_recording:
+        # Stop recording if we started it (no active viewers)
+        if not has_active_viewers:
             sim.camera.pause_recording()
 
         # Convert RGBA to RGB
@@ -512,25 +723,36 @@ def get_snapshot(token):
 @app.route('/health')
 def health_check():
     """Health check endpoint."""
+    # Thread-safe count of sessions
+    def _count_sessions():
+        active = sum(1 for s in simulations.values() if s._initialized)
+        total = len(simulations)
+        return active, total
+
+    active_sessions, total_sessions = _with_lock(_count_sessions)
+
     return jsonify({
         'status': 'ok',
-        'active_sessions': len([s for s in simulations.values() if s._initialized]),
-        'total_sessions': len(simulations)
+        'active_sessions': active_sessions,
+        'total_sessions': total_sessions
     })
 
 
-def start_stream_server(port: int = 9003, simulations_dict: Dict = None):
+def start_stream_server(port: int = 9003, simulations_dict: Dict = None, lock: threading.Lock = None):
     """
     Start the Flask streaming server in a background thread.
 
     Args:
         port: Port to run the stream server on (default: 9003)
         simulations_dict: Reference to the main server's simulations dictionary
+        lock: Threading lock to protect simulations dict access
     """
-    global simulations
+    global simulations, simulations_lock
 
     if simulations_dict is not None:
         simulations = simulations_dict
+    if lock is not None:
+        simulations_lock = lock
 
     def run_server():
         # Suppress Flask's startup messages for cleaner output

@@ -153,6 +153,10 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
             with self.simulations_lock:
                 sim = self.simulations.pop(token, None)
 
+            # Clean up stream viewer tracking state
+            from .stream_server import cleanup_viewer_state
+            cleanup_viewer_state(token)
+
             if sim is None:
                 # Nothing registered under this token. Still attempt to
                 # release the session in case it's a dangling allocation.
@@ -344,6 +348,9 @@ class GenesisRequestHandler(BaseHTTPRequestHandler):
             # Remove the competition sim from the streamed dict on stop.
             with self.simulations_lock:
                 self.simulations.pop("competition", None)
+            # Clean up stream viewer tracking state
+            from .stream_server import cleanup_viewer_state
+            cleanup_viewer_state("competition")
             return {"status": "ok"}
 
         if action == "admin_reset_board":
@@ -419,6 +426,10 @@ class GenesisServer(HTTPServer):
         self.allow_reuse_address = True
         super().__init__(("", port), GenesisRequestHandler)
 
+        # Register stream server cleanup callback for orphaned viewer counts
+        from .stream_server import cleanup_orphaned_viewer_counts
+        GenesisRequestHandler.session_manager.add_cleanup_callback(cleanup_orphaned_viewer_counts)
+
         GenesisRequestHandler.session_manager.start_cleanup_thread()
 
 
@@ -473,9 +484,13 @@ def main():
 
     server = GenesisServer()
 
-    # Start the streaming server
+    # Start the streaming server (pass lock for thread-safe dict access)
     from .stream_server import start_stream_server
-    start_stream_server(port=stream_port, simulations_dict=GenesisRequestHandler.simulations)
+    start_stream_server(
+        port=stream_port,
+        simulations_dict=GenesisRequestHandler.simulations,
+        lock=GenesisRequestHandler.simulations_lock
+    )
 
     print("  Server running. Press Ctrl+C to stop.\n")
 
@@ -483,6 +498,9 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n\nShutting down...")
+        # Stop all camera recordings before shutdown to prevent video file saves
+        from .stream_server import stop_all_recordings
+        stop_all_recordings()
         server.shutdown()
 
 

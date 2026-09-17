@@ -79,7 +79,7 @@ class GenesisSimulation:
                 camera_lookat=camera_lookat,
                 camera_up=camera_up,
                 camera_fov=camera_fov,
-                max_FPS=60,
+                refresh_rate=60,
             ),
             vis_options=gs.options.VisOptions(
                 # Bright, even lighting so colors read clearly and shadows
